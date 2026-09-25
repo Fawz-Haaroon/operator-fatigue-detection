@@ -1,8 +1,14 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
+
+# Model files (downloaded or trained — not committed)
+models/face_landmarker.task
+# Keep fatigue_bilstm.pth tracked IF it ever gets trained
+# models/fatigue_bilstm.pth
