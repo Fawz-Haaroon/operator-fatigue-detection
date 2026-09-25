@@ -1,4 +1,8 @@
-"""MediaPipe FaceMesh detector using the Tasks API (mediapipe >= 0.10.30)."""
+"""MediaPipe FaceMesh detector using the Tasks API (mediapipe >= 0.10.30).
+
+Returns 478 landmarks (468 face + 10 iris) as a numpy array of shape (478, 3)
+in pixel coordinates (x, y, z*w).
+"""
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -20,10 +24,6 @@ def _ensure_model():
 
 
 class FaceMeshDetector:
-    LEFT_EYE = [362, 385, 387, 263, 373, 380]
-    RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-    MOUTH = [61, 291, 39, 181, 0, 17, 269, 405]
-
     def __init__(self, max_faces=1, det_conf=0.5, track_conf=0.5):
         _ensure_model()
         base_options = mp_python.BaseOptions(model_asset_path=_MODEL_PATH)
@@ -36,14 +36,27 @@ class FaceMeshDetector:
             min_face_presence_confidence=track_conf,
         )
         self.landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        self._logged_count = False
 
     def detect(self, frame):
-        """Detect face landmarks. Returns (468, 3) numpy array or None."""
+        """Detect face landmarks.
+
+        Returns numpy array of shape (N, 3) in pixel coords, where N is
+        typically 478 (468 face + 10 iris). Returns None if no face found.
+        """
         rgb = np.ascontiguousarray(frame[:, :, ::-1])  # BGR -> RGB
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.landmarker.detect(mp_image)
+
         if not result.face_landmarks:
             return None
+
         landmarks = result.face_landmarks[0]
         h, w = frame.shape[:2]
-        return np.array([(lm.x * w, lm.y * h, lm.z * w) for lm in landmarks])
+        arr = np.array([(lm.x * w, lm.y * h, lm.z * w) for lm in landmarks])
+
+        if not self._logged_count:
+            print(f"[INFO] FaceMesh returning {arr.shape[0]} landmarks")
+            self._logged_count = True
+
+        return arr
