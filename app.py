@@ -1,16 +1,19 @@
-"""Main entry point — opens webcam and starts fatigue detection.
+"""Operator Fatigue Detection — real-time webcam monitoring.
 
-Run with --diag to show a detailed diagnostic overlay with all signal values.
+Uses SARATHI-V2's BiLSTM+Attention model with 10-feature extraction
+and per-session baseline normalization.
+
+Usage:
+  python app.py           # normal mode
+  python app.py --diag    # diagnostic overlay
 """
 import cv2
 import sys
 import time
+import numpy as np
 from src.vision.capture import CameraCapture
 from src.vision.face_mesh import FaceMeshDetector
-from src.features.ear import compute_ear
-from src.features.mar import compute_mar
-from src.features.perclos import PERCLOSTracker
-from src.features.head_pose import HeadPoseEstimator
+from src.features.feature_buffer import FeatureBuffer
 from src.model.predictor import FatiguePredictor
 from src.alerting.alert_manager import AlertManager
 from src.api.dashboard_client import DashboardClient
@@ -26,28 +29,30 @@ def main():
         config.MIN_DETECTION_CONFIDENCE,
         config.MIN_TRACKING_CONFIDENCE,
     )
-    perclos_tracker = PERCLOSTracker(config.PERCLOS_WINDOW, config.FPS)
-    head_pose = HeadPoseEstimator(config.FRAME_WIDTH, config.FRAME_HEIGHT)
-    predictor = FatiguePredictor(
-        config.MODEL_PATH, config.SEQUENCE_LENGTH,
-        config.INPUT_FEATURES, config.HIDDEN_SIZE, config.NUM_LAYERS,
+    feat_buffer = FeatureBuffer(
+        baseline_frames=config.BASELINE_FRAMES,
+        seq_len=config.SEQ_LEN,
+        perclos_window=config.PERCLOS_WINDOW,
+        ear_threshold=config.EAR_THRESHOLD,
     )
+    predictor = FatiguePredictor(config.MODEL_PATH, device="cpu")
     alert_manager = AlertManager(config.ALERT_SMOOTHING, config.ALERT_COOLDOWN)
     dashboard = DashboardClient(
         config.DASHBOARD_URL, config.DASHBOARD_SESSION_ID, config.PUSH_INTERVAL,
     )
 
-    # Resizable window
     cv2.namedWindow("Fatigue Monitor", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
     cv2.resizeWindow("Fatigue Monitor", 960, 720)
 
     print("[INFO] Fatigue detection started. Press 'q' to quit.")
-    if diag_mode:
-        print("[INFO] Diagnostic overlay enabled (--diag)")
+    if predictor.model_type == "none":
+        print("[WARN] No model — using rule-based fallback. Run: python setup_model.py")
 
     frame_count = 0
     fps_start = time.time()
     actual_fps = 0.0
+    last_label = "CALIBRATING"
+    last_prob = 0.0
 
     try:
         while True:
@@ -55,7 +60,6 @@ def main():
             if frame is None:
                 break
 
-            # FPS measurement
             frame_count += 1
             elapsed = time.time() - fps_start
             if elapsed >= 1.0:
@@ -72,33 +76,43 @@ def main():
                     break
                 continue
 
-            # Feature extraction
-            ear_left, ear_right = compute_ear(landmarks)
-            ear = (ear_left + ear_right) / 2.0
-            mar = compute_mar(landmarks)
-            pitch, yaw, roll = head_pose.estimate(landmarks)
-            eyes_closed = ear < config.EAR_THRESHOLD
-            perclos = perclos_tracker.update(eyes_closed)
-            blink_rate = perclos_tracker.blink_rate
+            h, w = frame.shape[:2]
+            sequence = feat_buffer.update(landmarks, w, h)
+            raw = feat_buffer.raw_features
 
-            # Fatigue scoring
-            fatigue_score = predictor.predict(
-                ear_left, ear_right, mar, perclos, pitch, yaw, roll, blink_rate,
-            )
-            alert = alert_manager.update(fatigue_score, perclos, mar, pitch)
+            if feat_buffer.calibrating:
+                progress = feat_buffer.calibration_progress
+                _draw_calibration(frame, progress, raw, actual_fps, diag_mode)
+                cv2.imshow("Fatigue Monitor", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
-            # === Display ===
+            if sequence is not None and len(feat_buffer.norm_buffer) % config.INFERENCE_EVERY == 0:
+                if predictor.model is not None:
+                    label, prob = predictor.predict_sequence(sequence)
+                    if label is not None:
+                        last_label = label
+                        last_prob = prob
+                else:
+                    score = FatiguePredictor.rule_based_score(
+                        raw[0], raw[5], raw[1], raw[3], raw[6],
+                    )
+                    last_prob = score
+                    last_label = "DROWSY" if score > 0.5 else "ALERT"
+
+            alert = None
+            if last_label == "DROWSY" and last_prob > 0.5:
+                alert = alert_manager.update(last_prob, raw[5], 0.0, raw[3])
+
             if diag_mode:
-                _draw_diag(frame, ear_left, ear_right, ear, mar, perclos,
-                           blink_rate, pitch, yaw, roll, eyes_closed,
-                           fatigue_score, actual_fps, perclos_tracker, alert)
+                _draw_diag(frame, raw, last_label, last_prob, actual_fps,
+                           feat_buffer, predictor.model_type, alert)
             else:
-                _draw_normal(frame, ear, mar, perclos, blink_rate,
-                             fatigue_score, alert)
+                _draw_normal(frame, last_label, last_prob, raw, alert)
 
-            # Dashboard push
             if alert:
-                dashboard.send_alert(fatigue_score, perclos, blink_rate, alert)
+                dashboard.send_alert(last_prob, raw[5], raw[6], alert)
 
             cv2.imshow("Fatigue Monitor", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -111,120 +125,86 @@ def main():
         print("[INFO] Fatigue detection stopped.")
 
 
-def _draw_normal(frame, ear, mar, perclos, blink_rate, score, alert):
-    """Standard HUD overlay."""
-    color = ((0, 255, 0) if score < config.MILD_THRESHOLD
-             else (0, 165, 255) if score < config.MODERATE_THRESHOLD
-             else (0, 0, 255))
-    cv2.putText(frame, f"Score: {score:.2f}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    cv2.putText(frame, f"EAR: {ear:.2f} | MAR: {mar:.2f}", (20, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    cv2.putText(frame, f"PERCLOS: {perclos:.2f} | Blinks: {blink_rate:.0f}/min",
-                (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    if alert:
-        cv2.putText(frame, f"ALERT: {alert['severity']}", (20, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-
-
-def _draw_diag(frame, ear_l, ear_r, ear, mar, perclos, blink_rate,
-               pitch, yaw, roll, eyes_closed, score, fps, tracker, alert):
-    """Detailed diagnostic overlay showing every signal."""
+def _draw_calibration(frame, progress, raw, fps, diag):
     h, w = frame.shape[:2]
+    bar_w = 300
+    bar_h = 20
+    bx = (w - bar_w) // 2
+    by = h // 2
 
-    # Semi-transparent background for readability
+    cv2.putText(frame, "CALIBRATING - sit normally, look at camera",
+                (bx - 40, by - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+    cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (100, 100, 100), -1)
+    fill = int(bar_w * progress)
+    cv2.rectangle(frame, (bx, by), (bx + fill, by + bar_h), (0, 200, 255), -1)
+    cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (255, 255, 255), 1)
+    pct = f"{progress * 100:.0f}%"
+    cv2.putText(frame, pct, (bx + bar_w + 10, by + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    if diag:
+        cv2.putText(frame, f"EAR: {raw[0]:.3f}  Gaze: {raw[1]:.3f}  FPS: {fps:.1f}",
+                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+
+
+def _draw_normal(frame, label, prob, raw, alert):
+    color = (0, 255, 0) if label == "ALERT" else (0, 0, 255)
+    cv2.putText(frame, f"{label} ({prob:.2f})", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    cv2.putText(frame, f"EAR: {raw[0]:.2f} | PERCLOS: {raw[5]:.2f} | Blinks: {raw[6]:.0f}/min",
+                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    if alert:
+        cv2.putText(frame, f"ALERT: {alert['severity']}", (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+
+
+def _draw_diag(frame, raw, label, prob, fps, buffer, model_type, alert):
+    h, w = frame.shape[:2]
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (340, h), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (350, h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
     white = (255, 255, 255)
-    gray = (160, 160, 160)
+    yellow = (0, 200, 255)
     green = (0, 255, 0)
     red = (0, 0, 255)
-    yellow = (0, 200, 255)
     font = cv2.FONT_HERSHEY_SIMPLEX
-
     y = 25
-    dy = 22
+    dy = 20
 
-    def line(label, value, color=white):
+    def line(lbl, val, col=white):
         nonlocal y
-        cv2.putText(frame, f"{label}: {value}", (10, y), font, 0.45, color, 1)
+        cv2.putText(frame, f"{lbl}: {val}", (10, y), font, 0.4, col, 1)
         y += dy
 
-    # Header
-    cv2.putText(frame, "DIAGNOSTIC", (10, y), font, 0.6, yellow, 2)
+    cv2.putText(frame, "DIAGNOSTIC", (10, y), font, 0.55, yellow, 2)
     y += dy + 5
 
-    # FPS
-    line("FPS (actual)", f"{fps:.1f}", green if fps > 20 else red)
-    line("Samples in window", f"{tracker.sample_count}")
-    line("Effective FPS", f"{tracker.effective_fps:.1f}")
+    line("Model", model_type, green if model_type != "none" else red)
+    line("FPS", f"{fps:.1f}")
+    line("Norm samples", f"{len(buffer.norm_buffer)}")
     y += 5
 
-    # EAR
-    cv2.putText(frame, "--- EAR ---", (10, y), font, 0.45, yellow, 1)
+    cv2.putText(frame, "--- RAW FEATURES ---", (10, y), font, 0.4, yellow, 1)
     y += dy
-    ear_color = red if eyes_closed else green
-    line("EAR left", f"{ear_l:.4f}", ear_color)
-    line("EAR right", f"{ear_r:.4f}", ear_color)
-    line("EAR avg", f"{ear:.4f}", ear_color)
-    line("Threshold", f"{config.EAR_THRESHOLD}")
-    line("Eyes closed", f"{eyes_closed}", red if eyes_closed else green)
-    y += 5
+    names = ["EAR", "Gaze", "Roll", "Pitch", "Yaw",
+             "PERCLOS", "Blink/min", "EAR var", "EAR min", "Gaze var"]
+    for i, name in enumerate(names):
+        val = raw[i]
+        col = white
+        if name == "EAR" and val < 0.21:
+            col = red
+        elif name == "PERCLOS" and val > 0.4:
+            col = red
+        line(name, f"{val:.4f}", col)
 
-    # MAR
-    cv2.putText(frame, "--- MAR ---", (10, y), font, 0.45, yellow, 1)
+    y += 5
+    cv2.putText(frame, "--- INFERENCE ---", (10, y), font, 0.4, yellow, 1)
     y += dy
-    mar_triggered = mar > config.MAR_THRESHOLD
-    line("MAR", f"{mar:.4f}", red if mar_triggered else white)
-    line("Threshold", f"{config.MAR_THRESHOLD}")
-    line("Triggered", f"{mar_triggered}", red if mar_triggered else gray)
-    y += 5
-
-    # PERCLOS
-    cv2.putText(frame, "--- PERCLOS ---", (10, y), font, 0.45, yellow, 1)
-    y += dy
-    perc_triggered = perclos > config.PERCLOS_THRESHOLD
-    line("PERCLOS", f"{perclos:.4f}", red if perc_triggered else white)
-    line("Threshold", f"{config.PERCLOS_THRESHOLD}")
-    line("Blink rate", f"{blink_rate:.1f}/min")
-    y += 5
-
-    # Head pose
-    cv2.putText(frame, "--- HEAD POSE ---", (10, y), font, 0.45, yellow, 1)
-    y += dy
-    pitch_triggered = abs(pitch) > config.HEAD_NOD_PITCH_THRESHOLD
-    line("Pitch", f"{pitch:.1f}", red if pitch_triggered else white)
-    line("Yaw", f"{yaw:.1f}")
-    line("Roll", f"{roll:.1f}")
-    line("Pitch thr", f"{config.HEAD_NOD_PITCH_THRESHOLD}")
-    y += 5
-
-    # Fatigue score breakdown
-    cv2.putText(frame, "--- SCORE ---", (10, y), font, 0.45, yellow, 1)
-    y += dy
-    # Show which rules fired
-    ear_contrib = 0.30 if ear < config.EAR_THRESHOLD else 0.0
-    perc_contrib = 0.30 if perclos > config.PERCLOS_THRESHOLD else 0.0
-    mar_contrib = 0.15 if mar > config.MAR_THRESHOLD else 0.0
-    pitch_contrib = 0.15 if abs(pitch) > config.HEAD_NOD_PITCH_THRESHOLD else 0.0
-    br_contrib = 0.10 if blink_rate < 8 else 0.0
-
-    line(f"EAR<{config.EAR_THRESHOLD}", f"+{ear_contrib:.2f}", red if ear_contrib > 0 else gray)
-    line(f"PERCLOS>{config.PERCLOS_THRESHOLD}", f"+{perc_contrib:.2f}", red if perc_contrib > 0 else gray)
-    line(f"MAR>{config.MAR_THRESHOLD}", f"+{mar_contrib:.2f}", red if mar_contrib > 0 else gray)
-    line(f"pitch>{config.HEAD_NOD_PITCH_THRESHOLD}", f"+{pitch_contrib:.2f}", red if pitch_contrib > 0 else gray)
-    line(f"blinks<8", f"+{br_contrib:.2f}", red if br_contrib > 0 else gray)
-    y += 5
-
-    score_color = green if score < 0.25 else yellow if score < 0.7 else red
-    cv2.putText(frame, f"SCORE: {score:.2f}", (10, y), font, 0.7, score_color, 2)
+    score_color = green if label == "ALERT" else red
+    cv2.putText(frame, f"{label}: {prob:.3f}", (10, y), font, 0.6, score_color, 2)
     y += dy + 5
-
     if alert:
-        cv2.putText(frame, f"ALERT: {alert['severity']}", (10, y),
-                    font, 0.7, red, 2)
+        cv2.putText(frame, f"ALERT: {alert['severity']}", (10, y), font, 0.6, red, 2)
 
 
 if __name__ == "__main__":

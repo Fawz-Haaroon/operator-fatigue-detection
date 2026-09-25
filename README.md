@@ -1,46 +1,62 @@
 # Operator Fatigue Detection System
 
-Real-time drowsiness/fatigue detection combining the best of SafeSteer, SARATHI-V2, driver-drowsiness-system-FYP, and DriverBehaviorDetectionSystem.
-
-## Features
-- **MediaPipe FaceMesh** landmark detection (468 points)
-- **EAR** (Eye Aspect Ratio) for blink detection
-- **MAR** (Mouth Aspect Ratio) for yawn detection
-- **PERCLOS** (Percentage of Eye Closure) over a sliding window
-- **Head Pose** estimation (pitch/yaw/roll)
-- **BiLSTM + Attention** model for fatigue classification
-- **Smoothed alerting** with escalation levels (Mild → Moderate → Severe)
-- **FastAPI** server pushing readings to a remote dashboard
+Real-time drowsiness/fatigue detection using **MediaPipe FaceMesh** + **BiLSTM+Attention** neural network (trained weights from SARATHI-V2).
 
 ## Quick Start
 
 ```bash
+git clone https://github.com/Fawz-Haaroon/operator-fatigue-detection.git
+cd operator-fatigue-detection
 pip install -r requirements.txt
-python app.py
+
+# Download trained model + MediaPipe model
+python setup_model.py
+
+# Run
+python app.py            # normal mode
+python app.py --diag     # with diagnostic overlay
 ```
 
-## Structure
-```
-├── src/vision/          # Camera + MediaPipe FaceMesh
-├── src/features/        # EAR, MAR, PERCLOS, head pose
-├── src/model/           # BiLSTM + attention network
-├── src/training/        # Training loop
-├── src/alerting/        # Alert smoothing + escalation
-├── src/api/             # FastAPI + dashboard client
-├── dashboard/           # Local web UI
-├── models/              # Saved checkpoints
-├── config.py            # All thresholds
-├── app.py               # Entry point
-└── Dockerfile
-```
+## How It Works
+
+1. **Camera** → frames at 640x480
+2. **MediaPipe FaceMesh** → 478 facial landmarks (including iris)
+3. **Feature extraction** → 10 features: EAR, gaze, roll/pitch/yaw, PERCLOS, blink rate, EAR variance/min, gaze variance
+4. **Calibration** → first ~11 seconds build your personal baseline (sit normally, look at camera)
+5. **Z-score normalization** → features normalized against baseline for person-independent detection
+6. **BiLSTM+Attention** → 200-frame sequence → drowsiness probability (0-1)
+7. **Alerting** → severity escalation with smoothing and cooldown
+
+## Model
+
+**Architecture**: BiLSTM+Attention (10 features, 128 hidden, 2 bidirectional LSTM layers, LayerNorm, attention, GELU)
+
+Trained on real labeled drowsiness data. Outputs sigmoid probability: >0.5 = drowsy.
 
 ## Configuration
-Edit `config.py` to tune: EAR_THRESHOLD, MAR_THRESHOLD, PERCLOS_WINDOW, ALERT_SMOOTHING, severity thresholds, DASHBOARD_URL.
 
-## Training
+Edit `config.py` — key settings:
+- `BASELINE_FRAMES`: Calibration duration (default: 330 = ~11s at 30fps)
+- `SEQ_LEN`: Model input window (default: 200 frames)
+- `INFERENCE_EVERY`: Model runs every N frames (default: 10)
+
+## Camera Setup (phone via scrcpy)
+
 ```bash
-python -m src.training.train --data dataset/ --epochs 50
+scrcpy --v4l2-sink=/dev/video0 --video-source=camera --camera-facing=front \
+  --video-codec=h264 --camera-size=1920x1080 --no-audio --no-window --no-playback
 ```
 
-## License
-MIT
+## Project Structure
+
+```
+src/vision/         Camera + MediaPipe FaceMesh (Tasks API)
+src/features/       Feature buffer + baseline normalization
+src/model/          BiLSTM+Attention network + predictor
+src/alerting/       Alert smoothing + escalation
+src/api/            Dashboard client
+models/             Downloaded model weights
+config.py           All settings
+app.py              Main entry point
+setup_model.py      Model downloader
+```
